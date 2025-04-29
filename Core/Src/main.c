@@ -1,0 +1,294 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : FFT tabanlı frekans bandı tespiti ve LED kontrolü
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "arm_math.h"    /* CMSIS-DSP FFT */
+#include <math.h>        /* sqrtf() */
+
+/* Private defines -----------------------------------------------------------*/
+#define FFT_SIZE     1024   /* 1024-nokta FFT */
+#define SAMPLE_RATE  8000   /* 8 kHz örnekleme */
+#define SMOOTH_ALPHA 0.2f   /* Ekponansiyel smoothing katsayısı */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef    hadc1;
+DMA_HandleTypeDef    hdma_adc1;
+TIM_HandleTypeDef    htim2;
+
+/* DMA ile toplanan ham ADC verisi */
+static uint16_t adc_buffer[FFT_SIZE];
+/* FFT için karmaşık giriş (Re, Im) ve genlik çıkış dizileri */
+static float32_t fft_input[2*FFT_SIZE];
+static float32_t fft_output[FFT_SIZE];
+
+/* Smoothing için önceki band magnitüdleri */
+static float32_t smoothB[4] = {0};
+
+/* Live Expression için global frekans değişkeni */
+volatile float32_t detectedFreq = 0;
+
+/* Bayrak: 1 olduğunda FFT hazır */
+volatile uint8_t data_ready = 0;
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM2_Init(void);
+void Error_Handler(void);
+
+/* USER CODE BEGIN 0 */
+/**
+  * @brief ADC dönüştürme + DMA tamamlandığında çağrılan callback
+  */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+{
+    if (hadc->Instance == ADC1)
+    {
+        data_ready = 1;
+    }
+}
+/* USER CODE END 0 */
+
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+  HAL_Init();
+  SystemClock_Config();
+  /* USER CODE END 1 */
+
+  /* Peripheral init */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_TIM2_Init();
+
+  /* 8 kHz tetiklemeli ADC+DMA başlat */
+  HAL_TIM_Base_Start(&htim2);
+  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, FFT_SIZE) != HAL_OK)
+    Error_Handler();
+
+  /* Infinite loop */
+  while (1)
+  {
+    if (data_ready)
+    {
+      data_ready = 0;
+      HAL_TIM_Base_Stop(&htim2);
+
+      /* --- DC offset kaldırma ve complex hazırlık --- */
+      uint32_t sum = 0;
+      for (uint16_t i = 0; i < FFT_SIZE; ++i)
+        sum += adc_buffer[i];
+      float32_t mean = (float32_t)sum / FFT_SIZE;
+      for (uint16_t i = 0; i < FFT_SIZE; ++i)
+      {
+        fft_input[2*i    ] = (float32_t)adc_buffer[i] - mean;
+        fft_input[2*i + 1] = 0.0f;
+      }
+
+      /* --- FFT --- */
+      arm_rfft_fast_instance_f32 fft_inst;
+      arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE);
+      arm_rfft_fast_f32(&fft_inst, fft_input, fft_output, 0);
+
+      /* --- Magnitude hesaplama --- */
+      for (uint16_t i = 0; i < FFT_SIZE/2; ++i)
+      {
+        float32_t re = fft_output[2*i];
+        float32_t im = fft_output[2*i + 1];
+        fft_output[i] = sqrtf(re*re + im*im);
+      }
+
+      /* --- RAW MAX BİN ve FREKANS HESABI --- */
+      uint32_t detectedMaxIndex = 1;
+      float32_t detectedMaxValue = fft_output[1];
+      for (uint16_t i = 2; i < FFT_SIZE/2; ++i)
+      {
+        if (fft_output[i] > detectedMaxValue)
+        {
+          detectedMaxValue = fft_output[i];
+          detectedMaxIndex = i;
+        }
+      }
+      detectedFreq = (float32_t)detectedMaxIndex * (SAMPLE_RATE * 2.0f) / FFT_SIZE;
+      // *** BREAKPOINT buraya koyun, Live Expressions’a detectedFreq ekleyin ***
+
+      /* --- Band aralıklarını tanımla (20–250, 251–500, 501–750, 751–1000 Hz) --- */
+      const uint16_t binStart[4] = {  3,  33,  65,  97 };
+      const uint16_t binEnd  [4] = { 32,  64,  96, 128 };
+
+      /* --- Her band için maksimumu bu sabit aralıklarda bul --- */
+      float32_t maxB[4] = {0};
+      for (uint8_t b = 0; b < 4; ++b)
+      {
+        for (uint16_t k = binStart[b]; k <= binEnd[b]; ++k)
+        {
+          if (fft_output[k] > maxB[b])
+            maxB[b] = fft_output[k];
+        }
+      }
+
+      /* --- Exponential smoothing --- */
+      for (uint8_t b = 0; b < 4; ++b)
+        smoothB[b] = SMOOTH_ALPHA * maxB[b] + (1.0f - SMOOTH_ALPHA) * smoothB[b];
+
+      /* --- Smoothing sonrası en büyük band seçimi --- */
+      uint8_t band = 0;
+      float32_t highest = smoothB[0];
+      for (uint8_t b = 1; b < 4; ++b)
+      {
+        if (smoothB[b] > highest)
+        {
+          highest = smoothB[b];
+          band = b;
+        }
+      }
+
+      /* --- LED kontrol --- */
+      if (highest < 100.0f)
+      {
+        HAL_GPIO_WritePin(GPIOD,
+          GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15,
+          GPIO_PIN_RESET);
+      }
+      else
+      {
+        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, (band==0)?GPIO_PIN_SET:GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, (band==1)?GPIO_PIN_SET:GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, (band==2)?GPIO_PIN_SET:GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_15, (band==3)?GPIO_PIN_SET:GPIO_PIN_RESET);
+      }
+
+      /* --- Yeniden başlat --- */
+      if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, FFT_SIZE) != HAL_OK)
+        Error_Handler();
+      HAL_TIM_Base_Start(&htim2);
+    }
+  }
+}
+
+/* USER CODE BEGIN 4 */
+void Error_Handler(void)
+{
+  HAL_GPIO_WritePin(GPIOD,
+    GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15,
+    GPIO_PIN_RESET);
+  __disable_irq();
+  while (1) {}
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief System Clock Configuration
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef       RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef       RCC_ClkInitStruct = {0};
+
+  RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState            = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM            = 4;
+  RCC_OscInitStruct.PLL.PLLN            = 168;
+  RCC_OscInitStruct.PLL.PLLP            = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ            = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+  RCC_ClkInitStruct.ClockType           = RCC_CLOCKTYPE_SYSCLK|RCC_CLOCKTYPE_HCLK
+                                        |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource        = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider       = RCC_SYSCLK_DIV2;
+  RCC_ClkInitStruct.APB1CLKDivider      = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider      = RCC_HCLK_DIV4;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) Error_Handler();
+}
+
+static void MX_GPIO_Init(void)
+{
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin   = GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin   = GPIO_PIN_1;
+  GPIO_InitStruct.Mode  = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+}
+
+static void MX_DMA_Init(void)
+{
+  __HAL_RCC_DMA2_CLK_ENABLE();
+  hdma_adc1.Instance                 = DMA2_Stream0;
+  hdma_adc1.Init.Channel             = DMA_CHANNEL_0;
+  hdma_adc1.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+  hdma_adc1.Init.PeriphInc           = DMA_PINC_DISABLE;
+  hdma_adc1.Init.MemInc              = DMA_MINC_ENABLE;
+  hdma_adc1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+  hdma_adc1.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
+  hdma_adc1.Init.Mode                = DMA_NORMAL;
+  hdma_adc1.Init.Priority            = DMA_PRIORITY_HIGH;
+  hdma_adc1.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+  if (HAL_DMA_Init(&hdma_adc1) != HAL_OK) Error_Handler();
+  __HAL_LINKDMA(&hadc1, DMA_Handle, hdma_adc1);
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+}
+
+static void MX_ADC1_Init(void)
+{
+  __HAL_RCC_ADC1_CLK_ENABLE();
+  ADC_ChannelConfTypeDef sConfig = {0};
+  hadc1.Instance                   = ADC1;
+  hadc1.Init.ClockPrescaler        = ADC_CLOCK_SYNC_PCLK_DIV2;
+  hadc1.Init.Resolution            = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode          = DISABLE;
+  hadc1.Init.ContinuousConvMode    = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.ExternalTrigConv      = ADC_EXTERNALTRIGCONV_T2_TRGO;
+  hadc1.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion       = 1;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.EOCSelection          = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+  sConfig.Channel      = ADC_CHANNEL_1;
+  sConfig.Rank         = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_84CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
+}
+
+static void MX_TIM2_Init(void)
+{
+  __HAL_RCC_TIM2_CLK_ENABLE();
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_ClockConfigTypeDef  sClockConfig  = {0};
+  htim2.Instance           = TIM2;
+  htim2.Init.Prescaler     = 83;
+  htim2.Init.CounterMode   = TIM_COUNTERMODE_UP;
+  htim2.Init.Period        = 124;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK) Error_Handler();
+  sClockConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockConfig) != HAL_OK) Error_Handler();
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) Error_Handler();
+}
