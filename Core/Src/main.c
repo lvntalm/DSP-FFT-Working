@@ -9,170 +9,131 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "arm_math.h"    /* CMSIS-DSP FFT */
-#include <math.h>        /* sqrtf() */
+#include "arm_math.h"  // CMSIS DSP Kütüphanesinde bulununa FFT'nin çalışması için gerekli header dosyası
+#include <math.h>
 
 /* Private defines -----------------------------------------------------------*/
-#define FFT_SIZE     1024   /* 1024-nokta FFT */
-#define SAMPLE_RATE  8000   /* 8 kHz örnekleme */
-#define SMOOTH_ALPHA 0.2f   /* Ekponansiyel smoothing katsayısı */
+#define FFT_SIZE     1024U           //Fast Fourier Transform örnekleme -- arttırılabilir ancak nu değer idealdir
+#define SAMPLE_RATE  8000.0f         // Örnekleme oranı -- 8000 / 1024 =~ 7.8125 çözünürlük
+#define SMOOTH_ALPHA 0.20f           // Smooth alfa degeri ( orta) geçmiş değerleri kullanma ağırlıklı %80 - %20
+#define PI           3.14159265358979f
 
 /* Private variables ---------------------------------------------------------*/
-ADC_HandleTypeDef    hadc1;
-DMA_HandleTypeDef    hdma_adc1;
-TIM_HandleTypeDef    htim2;
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+TIM_HandleTypeDef htim2;
 
-/* DMA ile toplanan ham ADC verisi */
-static uint16_t adc_buffer[FFT_SIZE];
-/* FFT için karmaşık giriş (Re, Im) ve genlik çıkış dizileri */
-static float32_t fft_input[2*FFT_SIZE];
-static float32_t fft_output[FFT_SIZE];
+static uint16_t  adc_buffer[FFT_SIZE];     // DMA ham örnekler
+static float32_t time_buf [FFT_SIZE];      // gerçek giriş dizisi
+static float32_t fft_out  [FFT_SIZE];      // RFFT çıktısı (packed)
+static float32_t mag      [FFT_SIZE/2];    // Genlikler
 
-/* Smoothing için önceki band magnitüdleri */
-static float32_t smoothB[4] = {0};
+static float32_t smoothB[4] = {0};    //Smooth dizisi
 
-/* Live Expression için global frekans değişkeni */
-volatile float32_t detectedFreq = 0;
+volatile uint8_t  data_ready   = 0;   //ADC 'nin DMA bufferını doldurduğuna dair flag
+volatile float32_t detectedFreq = 0.0f;  // Tespit edilen frekans değerine baslangic atandı
 
-/* Bayrak: 1 olduğunda FFT hazır */
-volatile uint8_t data_ready = 0;
-
-/* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_TIM2_Init(void);
+static void MX_TIM2_Init(void); //Timer2 ayarlanmıştır. 1/8000 = 0.125 us de bir timer tetiklemesi gerçekleşir.Bu durum ADC'nin continuous değer çekmesinden daha güvenli bir yöntemdir.
 void Error_Handler(void);
 
 /* USER CODE BEGIN 0 */
-/**
-  * @brief ADC dönüştürme + DMA tamamlandığında çağrılan callback
-  */
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-    if (hadc->Instance == ADC1)
-    {
-        data_ready = 1;
-    }
+    if (hadc->Instance == ADC1) data_ready = 1; // DMA dolduruluduğunda flag = 1
 }
 /* USER CODE END 0 */
 
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
   HAL_Init();
   SystemClock_Config();
-  /* USER CODE END 1 */
 
-  /* Peripheral init */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_TIM2_Init();
 
-  /* 8 kHz tetiklemeli ADC+DMA başlat */
   HAL_TIM_Base_Start(&htim2);
   if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, FFT_SIZE) != HAL_OK)
-    Error_Handler();
+      Error_Handler();
 
-  /* Infinite loop */
+  //CONTINUOUS LOOP
   while (1)
   {
-    if (data_ready)
+    if (!data_ready) continue;
+    data_ready = 0;
+    HAL_TIM_Base_Stop(&htim2);
+
+    /* 1. DC offset ve Hamming pencere ------------------------------------ */
+    uint32_t sum = 0;
+    for (uint16_t i = 0; i < FFT_SIZE; ++i) sum += adc_buffer[i];
+    const float32_t mean = (float32_t)sum / FFT_SIZE;
+
+    for (uint16_t i = 0; i < FFT_SIZE; ++i)
     {
-      data_ready = 0;
-      HAL_TIM_Base_Stop(&htim2);
-
-      /* --- DC offset kaldırma ve complex hazırlık --- */
-      uint32_t sum = 0;
-      for (uint16_t i = 0; i < FFT_SIZE; ++i)
-        sum += adc_buffer[i];
-      float32_t mean = (float32_t)sum / FFT_SIZE;
-      for (uint16_t i = 0; i < FFT_SIZE; ++i)
-      {
-        fft_input[2*i    ] = (float32_t)adc_buffer[i] - mean;
-        fft_input[2*i + 1] = 0.0f;
-      }
-
-      /* --- FFT --- */
-      arm_rfft_fast_instance_f32 fft_inst;
-      arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE);
-      arm_rfft_fast_f32(&fft_inst, fft_input, fft_output, 0);
-
-      /* --- Magnitude hesaplama --- */
-      for (uint16_t i = 0; i < FFT_SIZE/2; ++i)
-      {
-        float32_t re = fft_output[2*i];
-        float32_t im = fft_output[2*i + 1];
-        fft_output[i] = sqrtf(re*re + im*im);
-      }
-
-      /* --- RAW MAX BİN ve FREKANS HESABI --- */
-      uint32_t detectedMaxIndex = 1;
-      float32_t detectedMaxValue = fft_output[1];
-      for (uint16_t i = 2; i < FFT_SIZE/2; ++i)
-      {
-        if (fft_output[i] > detectedMaxValue)
-        {
-          detectedMaxValue = fft_output[i];
-          detectedMaxIndex = i;
-        }
-      }
-      detectedFreq = (float32_t)detectedMaxIndex * (SAMPLE_RATE * 2.0f) / FFT_SIZE;
-      // *** BREAKPOINT buraya koyun, Live Expressions’a detectedFreq ekleyin ***
-
-      /* --- Band aralıklarını tanımla (20–250, 251–500, 501–750, 751–1000 Hz) --- */
-      const uint16_t binStart[4] = {  3,  33,  65,  97 };
-      const uint16_t binEnd  [4] = { 32,  64,  96, 128 };
-
-      /* --- Her band için maksimumu bu sabit aralıklarda bul --- */
-      float32_t maxB[4] = {0};
-      for (uint8_t b = 0; b < 4; ++b)
-      {
-        for (uint16_t k = binStart[b]; k <= binEnd[b]; ++k)
-        {
-          if (fft_output[k] > maxB[b])
-            maxB[b] = fft_output[k];
-        }
-      }
-
-      /* --- Exponential smoothing --- */
-      for (uint8_t b = 0; b < 4; ++b)
-        smoothB[b] = SMOOTH_ALPHA * maxB[b] + (1.0f - SMOOTH_ALPHA) * smoothB[b];
-
-      /* --- Smoothing sonrası en büyük band seçimi --- */
-      uint8_t band = 0;
-      float32_t highest = smoothB[0];
-      for (uint8_t b = 1; b < 4; ++b)
-      {
-        if (smoothB[b] > highest)
-        {
-          highest = smoothB[b];
-          band = b;
-        }
-      }
-
-      /* --- LED kontrol --- */
-      if (highest < 100.0f)
-      {
-        HAL_GPIO_WritePin(GPIOD,
-          GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15,
-          GPIO_PIN_RESET);
-      }
-      else
-      {
-        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, (band==0)?GPIO_PIN_SET:GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, (band==1)?GPIO_PIN_SET:GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, (band==2)?GPIO_PIN_SET:GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_15, (band==3)?GPIO_PIN_SET:GPIO_PIN_RESET);
-      }
-
-      /* --- Yeniden başlat --- */
-      if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, FFT_SIZE) != HAL_OK)
-        Error_Handler();
-      HAL_TIM_Base_Start(&htim2);
+      float32_t x = (float32_t)adc_buffer[i] - mean;               // DC çıkar(Ölçülen - ortalama)
+      float32_t w = 0.54f - 0.46f * cosf(2.0f*PI*i/(FFT_SIZE-1));  // Hamming  işlemi
+      time_buf[i] = x * w;                                         //  gerçek dizi
     }
+
+   // FFT Dönüşümleri sağlayan dosya girdileri
+    arm_rfft_fast_instance_f32 S;
+    arm_rfft_fast_init_f32(&S, FFT_SIZE);
+    arm_rfft_fast_f32(&S, time_buf, fft_out, 0);
+
+    /* 3. Genlik ----------------------------------------------------------- */
+    mag[0] = fabsf(fft_out[0]);               // DC
+    for (uint16_t k = 1; k < FFT_SIZE/2; ++k)
+    {
+      float32_t re = fft_out[2*k];
+      float32_t im = fft_out[2*k + 1];
+      mag[k] = sqrtf(re*re + im*im);    //Büyüklük = karekök (re^2 + im^2)
+    }
+
+    /* 4. En yüksek bin & gerçek frekans ---------------------------------- */
+    uint32_t maxIdx = 1; float32_t maxVal = mag[1];
+    for (uint16_t k = 2; k < FFT_SIZE/2; ++k)
+      if (mag[k] > maxVal) { maxVal = mag[k]; maxIdx = k; }
+
+    detectedFreq = (float32_t)maxIdx * SAMPLE_RATE / FFT_SIZE;
+
+    /* 5. Bant maksimumları (20-250 / 251-500 / 501-750 / 751-1000 Hz) ---- */
+    /*250/7.8125 = 32 , 500/7.8125 = 64 , 750/7.8125 = 96 , 1000/7.8125 = 128 */
+    const uint16_t binStart[4] = {  3,  33,  65,  97 }; // frequency / ( sapmle rate / fft size) sonucları
+    const uint16_t binEnd  [4] = { 32,  64,  96, 128 };
+    float32_t maxB[4] = {0};
+
+    for (uint8_t b = 0; b < 4; ++b)
+      for (uint16_t k = binStart[b]; k <= binEnd[b]; ++k)
+        if (mag[k] > maxB[b]) maxB[b] = mag[k];
+
+    // 6. Smoothing İslemi
+    for (uint8_t b = 0; b < 4; ++b)
+      smoothB[b] = SMOOTH_ALPHA*maxB[b] + (1.0f-SMOOTH_ALPHA)*smoothB[b];
+
+    uint8_t band = 0; float32_t highest = smoothB[0];
+    for (uint8_t b = 1; b < 4; ++b)
+      if (smoothB[b] > highest) { highest = smoothB[b]; band = b; }
+
+    // 7. LED KONTROL
+    if (highest < 100.0f)   // gürültü eşiği - noise threshold
+      HAL_GPIO_WritePin(GPIOD, GPIO_PIN_All & 0xF000, GPIO_PIN_RESET);
+    else
+    {
+      HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, (band==0)?GPIO_PIN_SET:GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, (band==1)?GPIO_PIN_SET:GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, (band==2)?GPIO_PIN_SET:GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOD, GPIO_PIN_15, (band==3)?GPIO_PIN_SET:GPIO_PIN_RESET);
+    }
+
+    // 8. Yeni blok
+    if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, FFT_SIZE) != HAL_OK)
+        Error_Handler();
+    HAL_TIM_Base_Start(&htim2);
   }
 }
 
@@ -180,12 +141,15 @@ int main(void)
 void Error_Handler(void)
 {
   HAL_GPIO_WritePin(GPIOD,
-    GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15,
-    GPIO_PIN_RESET);
+      GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15,
+      GPIO_PIN_RESET);
   __disable_irq();
   while (1) {}
 }
 /* USER CODE END 4 */
+
+/* Rest of MX_* and SystemClock_Config() unchanged... */
+
 
 /**
   * @brief System Clock Configuration
